@@ -1,0 +1,5 @@
+SHA-256  DrPatil_Digital_OPD_V26_Final.html
+cb34b1bf9f14f2c5aa3d5af3a07e245ddd71c7a771ef6caf1e44f93aea6ac514
+
+SHA-256  InstrumentSerif-Italic.ttf
+9c86e4d5a47b50224a2463a9eca8535835257c8e85c470c2c6b454b1af6f046e
