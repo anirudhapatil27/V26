@@ -1,0 +1,539 @@
+name: Build Dr Patil Digital OPD V26 - Direct Patient Printing
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 20
+
+      - name: Set up Java
+        uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9 # v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
+
+      - name: Validate the exact V26 source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s DrPatil_Digital_OPD_V26_Final.html
+          test -s InstrumentSerif-Italic.ttf
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib
+          p=Path('DrPatil_Digital_OPD_V26_Final.html')
+          s=p.read_text(encoding='utf-8')
+          required=['id="printPatientCopy"','id="printFollowupPatientCopy"','id="print"','id="share"','id="printFollowup"','id="printArea"','window.print()','data-print-fu','data-direct-preview','data-preop-preview','exportCompleteBackup','dpod_records','dpod_followups','dpod_medicine_library','dpod_settings','dpod_preoperative_patients','dpod_reference_doctor_library','function printWithMode(mode, data, follow=false)',"printWithMode('digital-print',x,false)","printWithMode('digital-print',x,true)",'window.__opdPreviousDocumentTitle']
+          missing=[x for x in required if x not in s]
+          if missing: raise SystemExit('V26 source validation failed: '+', '.join(missing))
+          actual=hashlib.sha256(p.read_bytes()).hexdigest()
+          expected='cb34b1bf9f14f2c5aa3d5af3a07e245ddd71c7a771ef6caf1e44f93aea6ac514'
+          if actual!=expected: raise SystemExit('V26 final source checksum mismatch: '+actual)
+          print('V26 final source checksum verified:',actual)
+          print('V26 bytes:',p.stat().st_size)
+          print('All New Consultation, Follow-up, Patient Records and Pre-op print routes verified.')
+          PY
+
+      - name: Prepare V26 and install local PDF generator
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p www
+          cp DrPatil_Digital_OPD_V26_Final.html www/index.html
+          test -s InstrumentSerif-Italic.ttf
+          cp InstrumentSerif-Italic.ttf www/InstrumentSerif-Italic.ttf
+          cat > package.json <<'JSON'
+          {"name":"dr-patil-digital-opd","version":"1.0.0","private":true}
+          JSON
+          npm install --no-audit --no-fund @capacitor/core@6.1.2 @capacitor/android@6.1.2
+          npm install --no-audit --no-fund --save-dev @capacitor/cli@6.1.2
+          npm install --no-audit --no-fund html2pdf.js@0.10.3
+          test -s node_modules/html2pdf.js/dist/html2pdf.bundle.min.js
+          cp node_modules/html2pdf.js/dist/html2pdf.bundle.min.js www/html2pdf.bundle.min.js
+          cat > capacitor.config.json <<'JSON'
+          {"appId":"com.drpatil.digitalopd","appName":"Dr Patil Digital OPD","webDir":"www"}
+          JSON
+          npx cap add android
+          npx cap sync android
+
+      - name: Configure Android PDF FileProvider
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p android/app/src/main/res/xml
+          cat > android/app/src/main/res/xml/file_paths.xml <<'XML'
+          <?xml version="1.0" encoding="utf-8"?>
+          <paths><cache-path name="shared_pdfs" path="shared-pdfs/" /></paths>
+          XML
+          python3 - <<'PY'
+          from pathlib import Path
+          m=Path('android/app/src/main/AndroidManifest.xml')
+          s=m.read_text(encoding='utf-8')
+          if 'androidx.core.content.FileProvider' not in s:
+            provider='''
+                  <provider
+                      android:name="androidx.core.content.FileProvider"
+                      android:authorities="${applicationId}.fileprovider"
+                      android:exported="false"
+                      android:grantUriPermissions="true">
+                      <meta-data android:name="android.support.FILE_PROVIDER_PATHS" android:resource="@xml/file_paths" />
+                  </provider>
+            '''
+            if '</application>' not in s: raise SystemExit('AndroidManifest application tag missing')
+            m.write_text(s.replace('</application>',provider+'\n</application>',1),encoding='utf-8')
+          g=Path('android/app/build.gradle')
+          s=g.read_text(encoding='utf-8')
+          if 'androidx.core:core:' not in s:
+            if 'dependencies {' not in s: raise SystemExit('Gradle dependencies block missing')
+            g.write_text(s.replace('dependencies {',"dependencies {\n    implementation 'androidx.core:core:1.13.1'",1),encoding='utf-8')
+          assert 'androidx.core.content.FileProvider' in m.read_text(encoding='utf-8')
+          assert 'shared_pdfs' in Path('android/app/src/main/res/xml/file_paths.xml').read_text()
+          print('FileProvider configuration verified.')
+          PY
+
+      - name: Add native Android PDF creation and sharing bridge
+        shell: bash
+        run: |
+          set -euo pipefail
+          D=android/app/src/main/java/com/drpatil/digitalopd
+          mkdir -p "$D"
+          cat > "$D/MainActivity.java" <<'JAVA'
+          package com.drpatil.digitalopd;
+          import android.content.ClipData;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.net.Uri;
+          import android.os.Bundle;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.print.PrintAttributes;
+          import android.print.PrintManager;
+          import android.util.Base64;
+          import android.webkit.JavascriptInterface;
+          import android.webkit.WebView;
+          import android.widget.Toast;
+          import androidx.core.content.FileProvider;
+          import com.getcapacitor.BridgeActivity;
+          import org.json.JSONObject;
+          import java.io.File;
+          import java.io.FileOutputStream;
+          import java.io.IOException;
+
+          public class MainActivity extends BridgeActivity {
+              private final Handler handler = new Handler(Looper.getMainLooper());
+              private boolean installed = false;
+              @Override public void onCreate(Bundle state) {
+                  super.onCreate(state);
+                  handler.postDelayed(() -> installBridge(0), 300);
+              }
+              private void installBridge(int attempt) {
+                  if (installed) return;
+                  WebView view = bridge == null ? null : bridge.getWebView();
+                  if (view == null) {
+                      if (attempt < 80) handler.postDelayed(() -> installBridge(attempt + 1), 250);
+                      else Toast.makeText(this,"Android PDF bridge failed to initialise.",Toast.LENGTH_LONG).show();
+                      return;
+                  }
+                  view.addJavascriptInterface(new NativePdfBridge(this,view),"AndroidPrint");
+                  installed = true;
+                  view.postDelayed(view::reload,500);
+              }
+              public static final class NativePdfBridge {
+                  private final MainActivity activity;
+                  private final WebView webView;
+                  private final Handler main = new Handler(Looper.getMainLooper());
+                  NativePdfBridge(MainActivity a,WebView w){activity=a;webView=w;}
+                  @JavascriptInterface public String ping(){return "DR_PATIL_PDF_BRIDGE_READY_V2";}
+                  @JavascriptInterface public void print(){main.post(()->{
+                      try {
+                          PrintManager pm=(PrintManager)activity.getSystemService(Context.PRINT_SERVICE);
+                          if(pm==null)throw new IllegalStateException("Android Print service unavailable");
+                          String job="Dr Patil Digital OPD";
+                          PrintAttributes attrs=new PrintAttributes.Builder()
+                              .setMediaSize(PrintAttributes.MediaSize.ISO_A4)
+                              .setResolution(new PrintAttributes.Resolution("opd300","OPD 300 DPI",300,300))
+                              .setMinMargins(PrintAttributes.Margins.NO_MARGINS).build();
+                          pm.print(job,webView.createPrintDocumentAdapter(job),attrs);
+                          notifyPage("Android print dialog opened.",false);
+                      } catch(Exception e){fail("Print dialog failed: "+err(e));}
+                  });}
+                  @JavascriptInterface public void sharePdf(String encoded,String patient){main.post(()->saveAndShare(encoded,patient));}
+                  private void saveAndShare(String encoded,String patient){
+                      File file=null;
+                      try {
+                          if(encoded==null||encoded.length()<1000)throw new IllegalArgumentException("PDF data is empty");
+                          byte[] data=Base64.decode(encoded,Base64.DEFAULT);
+                          if(data.length<500||data[0]!='%'||data[1]!='P'||data[2]!='D'||data[3]!='F')throw new IllegalArgumentException("Generated data is not a valid PDF");
+                          File dir=new File(activity.getCacheDir(),"shared-pdfs");
+                          if(!dir.exists()&&!dir.mkdirs())throw new IOException("Cannot create PDF cache folder");
+                          String safe=(patient==null||patient.trim().isEmpty())?"Patient":patient.trim().replaceAll("[^a-zA-Z0-9._-]","_");
+                          if(safe.length()>50)safe=safe.substring(0,50);
+                          file=new File(dir,"DrPatil_"+safe+"_"+System.currentTimeMillis()+".pdf");
+                          try(FileOutputStream out=new FileOutputStream(file)){out.write(data);out.flush();out.getFD().sync();}
+                          if(!file.isFile()||file.length()!=data.length)throw new IOException("PDF was not completely written");
+                          Uri uri=FileProvider.getUriForFile(activity,activity.getPackageName()+".fileprovider",file);
+                          Intent send=new Intent(Intent.ACTION_SEND).setType("application/pdf");
+                          send.putExtra(Intent.EXTRA_STREAM,uri);
+                          send.setClipData(ClipData.newUri(activity.getContentResolver(),file.getName(),uri));
+                          send.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                          Intent chooser=Intent.createChooser(send,"Share patient PDF");
+                          chooser.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                          activity.startActivity(chooser);
+                          notifyPage("PDF file created. Choose WhatsApp, WhatsApp Business or Save to Files.",false);
+                      } catch(Exception e){if(file!=null&&file.exists())file.delete();fail("PDF creation/sharing failed: "+err(e));}
+                  }
+                  private String err(Exception e){return e.getClass().getSimpleName()+": "+String.valueOf(e.getMessage());}
+                  private void fail(String msg){notifyPage(msg,true);Toast.makeText(activity,msg,Toast.LENGTH_LONG).show();}
+                  private void notifyPage(String msg,boolean error){String q=JSONObject.quote(msg);webView.post(()->webView.evaluateJavascript("if(window.__drPatilPdfStatus){window.__drPatilPdfStatus("+q+","+error+");}",null));}
+              }
+          }
+          JAVA
+
+      - name: Connect all V26 digital PDF buttons to real PDF generation
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          from html.parser import HTMLParser
+          p=Path('www/index.html')
+          s=p.read_text(encoding='utf-8')
+          if 'id="dr-patil-pdf-generator-v2"' in s: raise SystemExit('Refusing duplicate PDF bridge injection')
+          tag='<script src="html2pdf.bundle.min.js"></script>\n'
+          if '</head>' not in s: raise SystemExit('V26 head closing tag missing')
+          s=s.replace('</head>',tag+'</head>',1)
+          bridge=r'''<script id="dr-patil-pdf-generator-v2">
+          (function(){
+            "use strict";
+            var state="checking",badge=null,attempts=0,timer=null,busy=false;
+            function show(message,isError){
+              try{
+                if(!document.body)return;
+                if(!badge){badge=document.createElement('div');badge.id='dr-patil-pdf-status';badge.style.cssText='position:fixed;left:8px;right:8px;bottom:8px;z-index:2147483647;padding:10px 12px;border-radius:9px;color:#fff;font:13px/1.4 system-ui,sans-serif;box-shadow:0 2px 12px #0005;display:none;text-align:center';document.body.appendChild(badge);}
+                badge.textContent=message;badge.style.background=isError?'#9b1c1c':'#245b42';badge.style.display='block';
+              }catch(e){}
+            }
+            window.__drPatilPdfStatus=show;
+            // Diagnostic checkpoint 1: this banner must appear even if AndroidPrint is absent.
+            function diagnostics(){
+              var html2pdfReady=typeof window.html2pdf==='function';
+              var androidObject=!!window.AndroidPrint;
+              var pingReady=false;
+              try{pingReady=!!(androidObject&&typeof window.AndroidPrint.ping==='function'&&window.AndroidPrint.ping()==='DR_PATIL_PDF_BRIDGE_READY_V2');}catch(e){}
+              window.__drPatilPdfDiagnostics={javascriptLoaded:true,html2pdfLoaded:html2pdfReady,androidObjectPresent:androidObject,androidPingReady:pingReady,checkedAt:new Date().toISOString()};
+              return window.__drPatilPdfDiagnostics;
+            }
+            show('PDF diagnostic 1/3: JavaScript loaded. Checking PDF library and Android service…',false);
+            function connect(){
+              try{
+                if(window.AndroidPrint&&typeof window.AndroidPrint.ping==='function'&&window.AndroidPrint.ping()==='DR_PATIL_PDF_BRIDGE_READY_V2'&&typeof window.AndroidPrint.print==='function'&&typeof window.AndroidPrint.sharePdf==='function'&&typeof window.html2pdf==='function'){
+                  state='connected';window.__drPatilPdfBridgeState=state;
+                  window.print=function(){
+                    if(busy){show('PDF is being created. Please wait.',false);return;}
+                    if(state!=='connected'){show('Android PDF service is not connected. Close and reopen the app.',true);return;}
+                    var area=document.getElementById('printArea');
+                    var page=area&&area.querySelector('.letter-page');
+                    if(!page){show('Patient document was not found in the print area.',true);return;}
+                    if((window._opdPrintMode||'digital')==='physical'||(window._opdPrintMode||'digital')==='digital-print'){
+                      var directPatientPrint=(window._opdPrintMode||'digital')==='digital-print';
+                      show(directPatientPrint?'Opening printer selection for complete patient copy…':'Opening print dialog for pre-printed letterhead…',false);
+                      try{window.AndroidPrint.print();}catch(e){show('Physical printing failed: '+String(e),true);}finally{window._opdPrintMode='digital';}return;
+                    }
+                    busy=true;show('Creating patient PDF…',false);
+                    var oldStyle=area.getAttribute('style');
+                    var css=document.createElement('style');css.id='dr-patil-pdf-layout-v2';
+                    css.textContent=collectV26PrintStyles();
+                    function collectV26PrintStyles(){
+                      var output=[];
+                      function visit(rules,insidePrint){
+                        for(var i=0;i<rules.length;i++){
+                          var rule=rules[i];
+                          if(rule.type===CSSRule.MEDIA_RULE){
+                            var mediaText=(rule.conditionText||(rule.media&&rule.media.mediaText)||'').toLowerCase();
+                            visit(rule.cssRules,insidePrint||/(^|,)\s*print\b/.test(mediaText));
+                          }else if(insidePrint&&rule.type!==CSSRule.PAGE_RULE){
+                            output.push(rule.cssText);
+                          }
+                        }
+                      }
+                      Array.prototype.forEach.call(document.styleSheets,function(sheet){
+                        try{visit(sheet.cssRules,false);}catch(e){}
+                      });
+                      if(!output.length)throw new Error('The original V26 A4 print stylesheet could not be loaded');
+                      return output.join('\n');
+                    }
+                    async function run(){
+                      try{
+                        document.head.appendChild(css);area.style.display='block';area.style.position='fixed';area.style.left='0';area.style.top='0';area.style.zIndex='2147483000';area.style.width='210mm';area.style.margin='0';area.style.padding='0';area.style.background='#fff';area.style.opacity='.01';area.style.pointerEvents='none';
+                        await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+                        if(document.fonts&&document.fonts.ready)await document.fonts.ready;
+                        var bg=page.querySelector('.letter-bg');
+                        if(bg&&!bg.complete)await new Promise((resolve,reject)=>{bg.onload=resolve;bg.onerror=()=>reject(new Error('Letterhead image did not load'));});
+                        if(bg&&bg.decode)await bg.decode();
+                        var clinical=page.querySelector('.letter-clinical');if(!clinical)throw new Error('Clinical note area is missing');
+                        var fs=8.8;while(clinical.scrollHeight>clinical.clientHeight+1&&fs>7){fs=Math.max(7,fs-.2);clinical.style.fontSize=fs+'pt';clinical.querySelectorAll('p,h3').forEach(n=>n.style.fontSize=(fs+(n.tagName==='H3'?.1:0))+'pt');}
+                        if(clinical.scrollHeight>clinical.clientHeight+2)throw new Error('Note is too long for the letterhead writing area');
+                        var result=await window.html2pdf().set({margin:0,image:{type:'jpeg',quality:.98},html2canvas:{scale:2,useCORS:true,backgroundColor:'#fff',logging:false,scrollX:0,scrollY:0,windowWidth:794,windowHeight:1123,onclone:function(doc){var a=doc.getElementById('printArea');if(a){a.style.opacity='1';a.style.position='static';a.style.left='auto';a.style.top='auto';a.style.zIndex='auto';}}},jsPDF:{unit:'mm',format:'a4',orientation:'portrait'},pagebreak:{mode:['css','legacy']}}).from(page).outputPdf('datauristring');
+                        var comma=result.indexOf(',');if(comma<0)throw new Error('PDF generator returned invalid data');
+                        var base64=result.substring(comma+1);if(!base64||base64.length<1000)throw new Error('Generated PDF is empty');
+                        var nameNode=page.querySelector('.letter-patient .name');var patient=nameNode?nameNode.textContent.trim():'Patient';
+                        show('PDF generated. Opening share options…',false);window.AndroidPrint.sharePdf(base64,patient||'Patient');
+                      }catch(e){show('PDF creation failed: '+(e&&e.message?e.message:String(e)),true);alert('Could not create patient PDF: '+(e&&e.message?e.message:String(e)));}
+                      finally{if(oldStyle===null)area.removeAttribute('style');else area.setAttribute('style',oldStyle);if(css.parentNode)css.parentNode.removeChild(css);busy=false;}
+                    }
+                    run();
+                  };
+                  show('PDF diagnostic 3/3: JavaScript, PDF library and Android bridge connected.',false);return true;
+                }
+              }catch(e){state='error';window.__drPatilPdfBridgeState=state;show('PDF bridge error: '+String(e),true);}
+              return false;
+            }
+            window.__drPatilPdfBridgeState=state;
+            window.print=function(){show('Android PDF service is not connected. Close and reopen the app.',true);alert('Android PDF service is not connected. Please close and reopen the OPD app.');};
+            function start(){
+              var d=diagnostics();
+              if(!d.html2pdfLoaded)show('PDF diagnostic 1/3: JavaScript loaded, but html2pdf library is MISSING.',true);
+              else if(!d.androidObjectPresent)show('PDF diagnostic 2/3: JavaScript and PDF library loaded; Android bridge is NOT PRESENT.',true);
+              else if(!d.androidPingReady)show('PDF diagnostic 2/3: Android bridge object exists, but its ping check FAILED.',true);
+              else show('PDF diagnostic: JavaScript, PDF library and Android ping detected. Checking methods…',false);
+              if(connect()||timer)return;
+              timer=setInterval(function(){attempts++;var d=diagnostics();
+                if(connect()){clearInterval(timer);timer=null;}
+                else if(attempts>=100){clearInterval(timer);timer=null;state='timeout';window.__drPatilPdfBridgeState=state;
+                  if(!d.html2pdfLoaded)show('PDF diagnostic FAILED: html2pdf library did not load.',true);
+                  else if(!d.androidObjectPresent)show('PDF diagnostic FAILED: AndroidPrint interface was never injected into WebView.',true);
+                  else if(!d.androidPingReady)show('PDF diagnostic FAILED: AndroidPrint.ping() did not return the expected response.',true);
+                  else show('PDF diagnostic FAILED: Android bridge methods or PDF connection check failed.',true);
+                }
+              },250);
+            }
+            if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',start,{once:true});else start();
+            document.addEventListener('visibilitychange',function(){if(!document.hidden&&state!=='connected')start();});
+          })();
+          </script>'''
+          # The V26 preview function contains the literal text '</body>'
+          # inside a JavaScript string used to build iframe srcdoc HTML.
+          # Replacing the first occurrence corrupts that JavaScript string and
+          # injects the bridge into the middle of the script. Insert only before
+          # the final, actual document closing body tag instead.
+          body_close=s.rfind('</body>')
+          if body_close < 0: raise SystemExit('V26 closing body tag missing')
+          s=s[:body_close]+bridge+'\n'+s[body_close:]
+          p.write_text(s,encoding='utf-8')
+          checks=['src="html2pdf.bundle.min.js"','id="dr-patil-pdf-generator-v2"','PDF diagnostic 1/3: JavaScript loaded','javascriptLoaded:true','DR_PATIL_PDF_BRIDGE_READY_V2','window.AndroidPrint.sharePdf(base64','window.AndroidPrint.print()','collectV26PrintStyles()','css.textContent=collectV26PrintStyles();','id="printPatientCopy"','id="printFollowupPatientCopy"','id="print"','id="share"','id="printFollowup"','data-print-fu','data-direct-preview','data-preop-preview']
+          missing=[x for x in checks if x not in s]
+          if missing: raise SystemExit('PDF bridge verification failed: '+', '.join(missing))
+          # Do not use a regular expression to extract script tags. V26 contains
+          # JavaScript template strings with literal '<script ...>' markup; a regex
+          # mistakes that markup for real HTML script elements and truncates code.
+          class ScriptExtractor(HTMLParser):
+              def __init__(self):
+                  super().__init__(convert_charrefs=False)
+                  self.in_script=False
+                  self.current=[]
+                  self.scripts=[]
+              def handle_starttag(self, tag, attrs):
+                  if tag.lower()=='script' and not self.in_script:
+                      self.in_script=True
+                      self.current=[]
+              def handle_data(self, data):
+                  if self.in_script:
+                      self.current.append(data)
+              def handle_endtag(self, tag):
+                  if tag.lower()=='script' and self.in_script:
+                      self.scripts.append(''.join(self.current))
+                      self.current=[]
+                      self.in_script=False
+          extractor=ScriptExtractor()
+          extractor.feed(s)
+          extractor.close()
+          scripts=[x for x in extractor.scripts if x.strip()]
+          if not scripts: raise SystemExit('No executable JavaScript script blocks found')
+          out=Path('/tmp/drpatil-v26-js-check')
+          out.mkdir(parents=True,exist_ok=True)
+          for old_file in out.glob('script-*.js'): old_file.unlink()
+          for i,script in enumerate(scripts):
+              (out/f'script-{i:03d}.js').write_text(script,encoding='utf-8')
+          print(f'Extracted {len(scripts)} actual HTML script blocks for independent syntax checks.')
+          print('All existing V26 digital PDF routes now generate a PDF and open Android share/save options.')
+          PY
+
+      - name: Verify source preservation and JavaScript syntax
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -d /tmp/drpatil-v26-js-check
+          shopt -s nullglob
+          JS_FILES=(/tmp/drpatil-v26-js-check/script-*.js)
+          test ${#JS_FILES[@]} -gt 0
+          for js in "${JS_FILES[@]}"; do
+            echo "Checking actual JavaScript block: $js"
+            node --check "$js"
+          done
+          python3 - <<'PY'
+          from pathlib import Path
+          original=Path('DrPatil_Digital_OPD_V26_Final.html').read_text(encoding='utf-8')
+          built=Path('www/index.html').read_text(encoding='utf-8')
+          marker='<script id="dr-patil-pdf-generator-v2">'
+          assert built.count(marker)==1,'PDF bridge script count is not one'
+          start=built.index(marker);end=built.index('</script>',start)+len('</script>')
+          stripped=built[:start]+built[end:]
+          stripped=stripped.replace('<script src="html2pdf.bundle.min.js"></script>\n','',1)
+          stripped=stripped.replace('\n</body>','</body>',1)
+          if stripped!=original: raise SystemExit('V26 source changed beyond the PDF additions')
+          assert Path('www/html2pdf.bundle.min.js').is_file()
+          print('V26 preservation and JavaScript syntax checks passed.')
+          PY
+
+
+      - name: Run Chromium PDF generation smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Install Playwright as a declared development dependency so npm
+          # retains it for the following Node.js smoke-test process.
+          npm install --no-audit --no-fund --save-dev playwright@1.56.1
+          node -e "console.log('Playwright resolved at:', require.resolve('playwright'))"
+          npx playwright install --with-deps chromium
+          cat > /tmp/drpatil-pdf-smoke.cjs <<'JS'
+          const { chromium } = require('playwright');
+          const path = require('path');
+          (async () => {
+            const browser = await chromium.launch({ headless: true });
+            const page = await browser.newPage({ viewport: { width: 794, height: 1123 } });
+            const pageErrors = [];
+            page.on('pageerror', e => pageErrors.push(e.message));
+            await page.addInitScript(() => {
+              window.AndroidPrint = {
+                ping: () => 'DR_PATIL_PDF_BRIDGE_READY_V2',
+                print: () => { window.__nativePrintCalled = true; },
+                sharePdf: (encoded, patient) => { window.__sharedPdf = { encoded, patient }; }
+              };
+            });
+            await page.goto('http://127.0.0.1:4173/index.html', { waitUntil: 'load' });
+            await page.waitForFunction(() => window.__drPatilPdfBridgeState === 'connected', null, { timeout: 30000 });
+            await page.waitForFunction(() => typeof window.html2pdf === 'function', null, { timeout: 30000 });
+
+            const routeInfo = await page.evaluate(() => ({
+              patientCopyPrint: !!document.getElementById('printPatientCopy'),
+              patientCopyHandlerBound: !!(document.getElementById('printPatientCopy') && document.getElementById('printPatientCopy').onclick),
+              followupPatientCopyPrint: !!document.getElementById('printFollowupPatientCopy'),
+              followupPatientCopyHandlerBound: !!(document.getElementById('printFollowupPatientCopy') && document.getElementById('printFollowupPatientCopy').onclick),
+              consultationPrint: !!document.getElementById('print'),
+              consultationShare: !!document.getElementById('share'),
+              followupPrint: !!document.getElementById('printFollowup'),
+              patientRecordPreviewRouteInSource: document.documentElement.innerHTML.includes('data-direct-preview'),
+              followupHistoryPrintRouteInSource: document.documentElement.innerHTML.includes('data-print-fu'),
+              preopPreviewRouteInSource: document.documentElement.innerHTML.includes('data-preop-preview')
+            }));
+            if (!Object.values(routeInfo).every(Boolean)) throw new Error('One or more V26 PDF routes are missing: ' + JSON.stringify(routeInfo));
+
+            await page.evaluate(() => {
+              const area = document.getElementById('printArea');
+              area.innerHTML = '<section class="letter-page physical"><div class="letter-patient"><div class="v name">Physical Print Test</div></div><div class="letter-clinical"><h3>Clinical note</h3><p>Native print bridge smoke test.</p></div></section>';
+              window._opdPrintMode = 'physical';
+              window.print();
+            });
+            await page.waitForFunction(() => window.__nativePrintCalled === true, null, { timeout: 10000 });
+            await page.evaluate(() => { window.__nativePrintCalled = false; });
+
+            await page.evaluate(() => {
+              const area = document.getElementById('printArea');
+              area.innerHTML = '<section class="letter-page digital"><div class="letter-patient"><div class="v name">Direct Print Smoke Test</div></div><div class="letter-clinical"><h3>Clinical note</h3><p>Native direct-print route verification.</p></div></section>';
+              window._opdPrintMode = 'digital-print';
+              window.print();
+            });
+            await page.waitForFunction(() => window.__nativePrintCalled === true, null, { timeout: 10000 });
+            await page.evaluate(() => { window.__nativePrintCalled = false; });
+
+            await page.evaluate(() => {
+              const area = document.getElementById('printArea');
+              area.innerHTML = '<section class="letter-page digital"><div class="letter-patient"><div class="v name">PDF Smoke Test</div><div class="v age">40 / M</div></div><div class="letter-clinical"><h3>Clinical note</h3><p>V26 digital PDF generation verification.</p></div><div class="letter-signature">Doctor signature</div></section>';
+              window._opdPrintMode = 'digital';
+              window.print();
+            });
+            await page.waitForFunction(() => !!window.__sharedPdf, null, { timeout: 60000 });
+            const result = await page.evaluate(() => ({
+              encoded: window.__sharedPdf.encoded,
+              patient: window.__sharedPdf.patient,
+              diagnostics: window.__drPatilPdfDiagnostics
+            }));
+            const pdf = Buffer.from(result.encoded, 'base64');
+            if (pdf.subarray(0, 4).toString() !== '%PDF') throw new Error('PDF output does not have a valid PDF signature');
+            if (pdf.length < 1500) throw new Error('Generated PDF is unexpectedly small: ' + pdf.length);
+            if (result.patient !== 'PDF Smoke Test') throw new Error('Patient name was not passed to the native share bridge');
+            if (pageErrors.length) throw new Error('Browser JavaScript errors: ' + pageErrors.join(' | '));
+            console.log('V26 PDF smoke test passed:', JSON.stringify({
+              routes: routeInfo,
+              pdfBytes: pdf.length,
+              pdfHeader: pdf.subarray(0, 8).toString(),
+              patient: result.patient,
+              diagnostics: result.diagnostics
+            }));
+            await browser.close();
+          })().catch(e => { console.error(e); process.exit(1); });
+          JS
+          python3 -m http.server 4173 --directory www >/tmp/drpatil-http.log 2>&1 &
+          SERVER_PID=$!
+          trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT
+          sleep 2
+          node /tmp/drpatil-pdf-smoke.cjs
+
+      - name: Verify native PDF bridge configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          J=android/app/src/main/java/com/drpatil/digitalopd/MainActivity.java
+          grep -q 'class MainActivity extends BridgeActivity' "$J"
+          grep -q 'DR_PATIL_PDF_BRIDGE_READY_V2' "$J"
+          grep -q 'void sharePdf(String encoded,String patient)' "$J"
+          grep -q 'FileProvider.getUriForFile' "$J"
+          grep -q 'androidx.core.content.FileProvider' android/app/src/main/AndroidManifest.xml
+          test -s android/app/src/main/res/xml/file_paths.xml
+          echo 'Native PDF creation/sharing checks passed.'
+
+      - name: Build and integrity-check APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd android
+          chmod +x gradlew
+          ./gradlew --no-daemon --stacktrace assembleDebug
+          APK=app/build/outputs/apk/debug/app-debug.apk
+          test -s "$APK"
+          unzip -t "$APK" >/dev/null
+          echo 'APK created; archive integrity passed.'
+          AAPT=$(find "$ANDROID_HOME/build-tools" -name aapt -type f | sort -V | tail -1)
+          APKSIGNER=$(find "$ANDROID_HOME/build-tools" -name apksigner -type f | sort -V | tail -1)
+          test -n "$AAPT" && test -n "$APKSIGNER"
+          "$AAPT" dump badging "$APK" | grep -q "package: name='com.drpatil.digitalopd'"
+          "$APKSIGNER" verify "$APK"
+          echo 'APK package ID and signature verified.'
+          ls -lh "$APK"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: Dr-Patil-Digital-OPD-V26-Direct-Print
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
